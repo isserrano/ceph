@@ -4562,6 +4562,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	string aname;
 	bp.copy(op.xattr.name_len, aname);
 	tracepoint(osd, do_osd_op_pre_rmxattr, soid.oid.name.c_str(), soid.snap.val, aname.c_str());
+	if (!obs.exists || oi.is_whiteout()) {
+	  result = -ENOENT;
+	  break;
+	}
 	string name = "_" + aname;
 	if (pool.info.require_rollback()) {
 	  map<string, boost::optional<bufferlist> > to_set;
@@ -4716,7 +4720,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	tracepoint(osd, do_osd_op_pre_omapgetkeys, soid.oid.name.c_str(), soid.snap.val, start_after.c_str(), max_return);
 	set<string> out_set;
 
-	if (!pool.info.require_rollback()) {
+	if (pool.info.supports_omap()) {
 	  ObjectMap::ObjectMapIterator iter = osd->store->get_omap_iterator(
 	    coll, soid
 	    );
@@ -4753,7 +4757,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	tracepoint(osd, do_osd_op_pre_omapgetvals, soid.oid.name.c_str(), soid.snap.val, start_after.c_str(), max_return, filter_prefix.c_str());
 	map<string, bufferlist> out_set;
 
-	if (!pool.info.require_rollback()) {
+	if (pool.info.supports_omap()) {
 	  ObjectMap::ObjectMapIterator iter = osd->store->get_omap_iterator(
 	    coll, soid
 	    );
@@ -4779,7 +4783,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
     case CEPH_OSD_OP_OMAPGETHEADER:
       tracepoint(osd, do_osd_op_pre_omapgetheader, soid.oid.name.c_str(), soid.snap.val);
-      if (pool.info.require_rollback()) {
+      if (!pool.info.supports_omap()) {
 	// return empty header
 	break;
       }
@@ -4805,7 +4809,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	}
 	tracepoint(osd, do_osd_op_pre_omapgetvalsbykeys, soid.oid.name.c_str(), soid.snap.val, list_entries(keys_to_get).c_str());
 	map<string, bufferlist> out;
-	if (!pool.info.require_rollback()) {
+	if (pool.info.supports_omap()) {
 	  osd->store->omap_get_values(coll, soid, keys_to_get, &out);
 	} // else return empty omap entries
 	::encode(out, osd_op.outdata);
@@ -4835,7 +4839,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	
 	map<string, bufferlist> out;
 
-	if (!pool.info.require_rollback()) {
+	if (pool.info.supports_omap()) {
 	  set<string> to_get;
 	  for (map<string, pair<bufferlist, int> >::iterator i = assertions.begin();
 	       i != assertions.end();
@@ -4889,7 +4893,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
       // OMAP Write ops
     case CEPH_OSD_OP_OMAPSETVALS:
-      if (pool.info.require_rollback()) {
+      if (!pool.info.supports_omap()) {
 	result = -EOPNOTSUPP;
 	tracepoint(osd, do_osd_op_pre_omapsetvals, soid.oid.name.c_str(), soid.snap.val, "???");
 	break;
@@ -4925,7 +4929,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
     case CEPH_OSD_OP_OMAPSETHEADER:
       tracepoint(osd, do_osd_op_pre_omapsetheader, soid.oid.name.c_str(), soid.snap.val);
-      if (pool.info.require_rollback()) {
+      if (!pool.info.supports_omap()) {
 	result = -EOPNOTSUPP;
 	break;
       }
@@ -4946,7 +4950,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
     case CEPH_OSD_OP_OMAPCLEAR:
       tracepoint(osd, do_osd_op_pre_omapclear, soid.oid.name.c_str(), soid.snap.val);
-      if (pool.info.require_rollback()) {
+      if (!pool.info.supports_omap()) {
 	result = -EOPNOTSUPP;
 	break;
       }
@@ -4966,7 +4970,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_OMAPRMKEYS:
-      if (pool.info.require_rollback()) {
+      if (!pool.info.supports_omap()) {
 	result = -EOPNOTSUPP;
 	tracepoint(osd, do_osd_op_pre_omaprmkeys, soid.oid.name.c_str(), soid.snap.val, "???");
 	break;
@@ -6259,7 +6263,7 @@ void ReplicatedPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
   if (cop->omap_data.length())
     cop->results.has_omap = true;
 
-  if (r >= 0 && pool.info.require_rollback() && cop->omap_data.length()) {
+  if (r >= 0 && !pool.info.supports_omap() && cop->omap_data.length()) {
     r = -EOPNOTSUPP;
   }
   cop->objecter_tid = 0;
@@ -6372,11 +6376,13 @@ void ReplicatedPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
   cobc->stop_block();
 
   // cancel and requeue proxy reads on this object
-  kick_proxy_read_blocked(cobc->obs.oi.soid);
-  for (map<ceph_tid_t, ProxyReadOpRef>::iterator it = proxyread_ops.begin();
-      it != proxyread_ops.end(); ++it) {
-    if (it->second->soid == cobc->obs.oi.soid) {
-      cancel_proxy_read(it->second);
+  if (!r) {
+    kick_proxy_read_blocked(cobc->obs.oi.soid);
+    for (map<ceph_tid_t, ProxyReadOpRef>::iterator it = proxyread_ops.begin();
+	it != proxyread_ops.end(); ++it) {
+      if (it->second->soid == cobc->obs.oi.soid) {
+	cancel_proxy_read(it->second);
+      }
     }
   }
 
@@ -6563,9 +6569,10 @@ void ReplicatedPG::finish_promote(int r, CopyResults *results,
     return;
   }
 
-  if (r == -ENOENT && results->started_temp_obj) {
+  if (r < 0 && results->started_temp_obj) {
     dout(10) << __func__ << " abort; will clean up partial work" << dendl;
-    ObjectContextRef tempobc = get_object_context(results->temp_oid, true);
+    ObjectContextRef tempobc = get_object_context(results->temp_oid, false);
+    assert(tempobc);
     RepGather *repop = simple_repop_create(tempobc);
     repop->ctx->op_t->remove(results->temp_oid);
     simple_repop_submit(repop);
@@ -10613,8 +10620,8 @@ bool ReplicatedPG::agent_work(int start_max)
     }
 
     // be careful flushing omap to an EC pool.
-    if (base_pool->is_erasure() &&
-	obc->obs.oi.test_flag(object_info_t::FLAG_OMAP)) {
+    if (!base_pool->supports_omap() &&
+	obc->obs.oi.is_omap()) {
       dout(20) << __func__ << " skip (omap to EC) " << obc->obs.oi << dendl;
       osd->logger->inc(l_osd_agent_skip);
       continue;
@@ -10951,7 +10958,7 @@ bool ReplicatedPG::agent_choose_mode(bool restart, OpRequestRef op)
   // also exclude omap objects if ec backing pool
   const pg_pool_t *base_pool = get_osdmap()->get_pg_pool(pool.info.tier_of);
   assert(base_pool);
-  if (base_pool->is_erasure())
+  if (!base_pool->supports_omap())
     unflushable += info.stats.stats.sum.num_objects_omap;
 
   uint64_t num_user_objects = info.stats.stats.sum.num_objects;
@@ -10966,7 +10973,7 @@ bool ReplicatedPG::agent_choose_mode(bool restart, OpRequestRef op)
 
   // also reduce the num_dirty by num_objects_omap
   int64_t num_dirty = info.stats.stats.sum.num_objects_dirty;
-  if (base_pool->is_erasure()) {
+  if (!base_pool->supports_omap()) {
     if (num_dirty > info.stats.stats.sum.num_objects_omap)
       num_dirty -= info.stats.stats.sum.num_objects_omap;
     else
